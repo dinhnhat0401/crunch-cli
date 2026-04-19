@@ -3,8 +3,10 @@ import ImageIO
 import CoreGraphics
 import UniformTypeIdentifiers
 
-/// Still-image and animated-image compressor. Implements the static pipeline
-/// and the animated pass-through described in SYSTEM-DESIGN §9.2.
+/// Still-image compressor implementing the static ImageIO pipeline
+/// described in SYSTEM-DESIGN §9.2. Animated inputs are rejected in v1.0
+/// with `.unsupportedFormat(detected: "animated-<format>")`; per-frame
+/// recompression is planned for v1.1.
 struct ImageCompressor: Compressor {
     typealias KindPreset = ImagePreset
 

@@ -34,8 +34,8 @@ public struct CompressionResult: Sendable, Hashable {
     }
 
     /// Fractional savings — `1.0 - outputBytes / sourceBytes`. Zero when
-    /// the source was passed through unchanged (e.g. animated images in v1.0),
-    /// and zero when `sourceBytes == 0`.
+    /// `sourceBytes == 0`. Negative if the output grew (rare; can happen
+    /// at very high quality settings on already-compact sources).
     public var savingsRatio: Double {
         guard sourceBytes > 0 else { return 0 }
         return 1.0 - Double(outputBytes) / Double(sourceBytes)

@@ -123,18 +123,17 @@ final class CLIE2ETests: XCTestCase {
 
     // MARK: - Error-path exit-code contract (SYSTEM-DESIGN §10.3)
 
-    /// Unsupported format (missing file, no extension, empty) → exit 2 or
-    /// exit 3 depending on whether detection failed at the format level
-    /// (2) or at the I/O level (3). The CLI's public contract reserves both
-    /// codes; we assert the code is one of them and isn't 0.
-    func testCLIMissingFileExitsNonZero() throws {
+    /// P2 regression: a missing source file must surface as
+    /// `.sourceUnreadable` (exit 3) — **not** `.unsupportedFormat` (2) or
+    /// `.compressionFailed` (4). The old behaviour routed missing-file
+    /// errors through the compressor and produced exit 4, which scripts
+    /// can't distinguish from a legitimate compression failure. Assert
+    /// exactly 3 so the regression locks in.
+    func testCLIMissingFileExits3() throws {
         let result = try runCLI(["/does/not/exist/abc.jpg", "--quiet"])
-        XCTAssertNotEqual(result.exitCode, 0)
-        // Missing file typically surfaces as unsupported-format or
-        // source-unreadable — both are in the expected error set.
-        XCTAssertTrue(
-            [2, 3].contains(result.exitCode),
-            "expected exit 2 or 3 for missing file, got \(result.exitCode); stderr:\n\(result.stderr)"
+        XCTAssertEqual(
+            result.exitCode, 3,
+            "expected exit 3 for missing file, got \(result.exitCode); stderr:\n\(result.stderr)"
         )
     }
 
