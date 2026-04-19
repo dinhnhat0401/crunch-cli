@@ -44,22 +44,29 @@ struct ImageCompressor: Compressor {
 
                     let frameCount = CGImageSourceGetCount(src)
                     let topProps = CGImageSourceCopyProperties(src, nil) as? [CFString: Any] ?? [:]
-                    let isAnimated = frameCount > 1 && ImageCompressor.looksAnimated(properties: topProps)
+                    let animationFormat = ImageCompressor.animatedFormat(
+                        properties: topProps,
+                        frameCount: frameCount
+                    )
 
                     try Task.checkCancellation()
 
-                    if isAnimated {
-                        // Pass-through: copy bytes unchanged. See SYSTEM-DESIGN §9.2 Option A.
-                        try FileManager.default.copyItem(at: source, to: tmpURL)
-                    } else {
-                        try ImageCompressor.writeStatic(
-                            source: src,
-                            sourceURL: source,
-                            tmpURL: tmpURL,
-                            preset: preset,
-                            commonOptions: commonOptions
-                        )
+                    // v1.0: reject animated inputs. Per-frame recompression is v1.1
+                    // (SYSTEM-DESIGN §9.2 Option B). A silent byte-copy would
+                    // ignore user-requested `resize` / `stripMetadata` / preset
+                    // quality — we'd rather surface an honest error than lie
+                    // about having honoured the request.
+                    if let format = animationFormat {
+                        throw CrunchError.unsupportedFormat(detected: "animated-\(format)")
                     }
+
+                    try ImageCompressor.writeStatic(
+                        source: src,
+                        sourceURL: source,
+                        tmpURL: tmpURL,
+                        preset: preset,
+                        commonOptions: commonOptions
+                    )
 
                     try Task.checkCancellation()
 
@@ -185,14 +192,22 @@ struct ImageCompressor: Compressor {
 
     // MARK: - Animated detection
 
-    private static func looksAnimated(properties: [CFString: Any]) -> Bool {
-        if properties[kCGImagePropertyGIFDictionary] != nil { return true }
-        if properties[kCGImagePropertyPNGDictionary] != nil { return true } // APNG rides on PNG dict
-        if properties[kCGImagePropertyHEICSDictionary] != nil { return true }
+    /// Returns the short format name (`"gif"`, `"apng"`, `"webp"`, `"heics"`)
+    /// if the properties describe an animated image with `frameCount > 1`,
+    /// otherwise `nil`. APNG rides on the PNG property dictionary — a
+    /// multi-frame PNG is animated by definition.
+    private static func animatedFormat(
+        properties: [CFString: Any],
+        frameCount: Int
+    ) -> String? {
+        guard frameCount > 1 else { return nil }
+        if properties[kCGImagePropertyGIFDictionary] != nil { return "gif" }
+        if properties[kCGImagePropertyPNGDictionary] != nil { return "apng" }
+        if properties[kCGImagePropertyHEICSDictionary] != nil { return "heics" }
         if #available(macOS 14.0, *) {
-            if properties[kCGImagePropertyWebPDictionary] != nil { return true }
+            if properties[kCGImagePropertyWebPDictionary] != nil { return "webp" }
         }
-        return false
+        return nil
     }
 
     // MARK: - Filesystem helpers

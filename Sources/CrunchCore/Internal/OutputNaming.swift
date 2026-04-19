@@ -13,15 +13,15 @@ enum OutputNaming {
         _ destination: CompressionRequest.Destination,
         source: URL
     ) throws -> URL {
+        let candidate: URL
         switch destination {
         case .explicit(let url):
-            return url
+            candidate = url
         case .alongsideSource(let suffix):
             let directory = source.deletingLastPathComponent()
             let ext = source.pathExtension
             let stem = source.deletingPathExtension().lastPathComponent
             let newStem = stem + suffix
-            let candidate: URL
             if ext.isEmpty {
                 candidate = directory.appendingPathComponent(newStem)
             } else {
@@ -29,7 +29,21 @@ enum OutputNaming {
                     .appendingPathComponent(newStem)
                     .appendingPathExtension(ext)
             }
-            return candidate
         }
+
+        // Reject destinations that resolve to the source file itself —
+        // regardless of the `overwriteExisting` flag. Writing to the source
+        // path would turn compression into destructive in-place mutation.
+        if canonicalPath(of: candidate) == canonicalPath(of: source) {
+            throw CrunchError.destinationMatchesSource(candidate)
+        }
+        return candidate
+    }
+
+    /// Canonical absolute path for comparison. Uses `standardizedFileURL` +
+    /// `resolvingSymlinksInPath` so `/tmp/foo.jpg`, `/private/tmp/foo.jpg`,
+    /// and `./foo.jpg` all compare equal when they point at the same file.
+    private static func canonicalPath(of url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
     }
 }

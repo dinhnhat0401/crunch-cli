@@ -8,6 +8,21 @@ enum FileKindDetector {
     /// if the file can't be opened, or `.unsupportedFormat` if neither the
     /// UTType nor the header sniff identify a supported kind.
     static func detect(at url: URL) throws -> FileKind {
+        // Step 0 — verify the file actually exists and is readable.
+        // Extension-based detection is fast but doesn't touch the
+        // filesystem; without this guard, a missing file with a recognised
+        // extension would return a kind and the downstream compressor
+        // would surface the I/O failure as `.compressionFailed` instead of
+        // `.sourceUnreadable`, confusing scripts and the CLI exit-code
+        // contract.
+        guard FileManager.default.isReadableFile(atPath: url.path) else {
+            throw CrunchError.sourceUnreadable(
+                underlying: CocoaError(.fileReadNoSuchFile, userInfo: [
+                    NSFilePathErrorKey: url.path,
+                ])
+            )
+        }
+
         // Step 1 — try UTType based on file extension.
         if let type = UTType(filenameExtension: url.pathExtension.lowercased()) {
             if let kind = kindForUTType(type) {

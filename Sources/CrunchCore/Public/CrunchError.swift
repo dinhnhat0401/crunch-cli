@@ -12,6 +12,10 @@ public enum CrunchError: Error, Sendable {
     case destinationNotWritable(URL)
     /// The destination already exists and `overwriteExisting` is `false`.
     case destinationAlreadyExists(URL)
+    /// The resolved destination path is the same file as the source. Rejected
+    /// unconditionally — even with `overwriteExisting = true` — to prevent a
+    /// compression job from silently destroying its input.
+    case destinationMatchesSource(URL)
     /// The destination volume doesn't have enough free space.
     case insufficientDiskSpace(needed: Int64, available: Int64)
     /// The caller passed a concrete kind-scoped `Preset` that doesn't match
@@ -46,6 +50,8 @@ extension CrunchError: CustomStringConvertible {
             return "destination not writable: \(url.path)"
         case .destinationAlreadyExists(let url):
             return "destination already exists: \(url.path)"
+        case .destinationMatchesSource(let url):
+            return "destination matches source: \(url.path) — pick a different output path"
         case .insufficientDiskSpace(let needed, let available):
             return "insufficient disk space: need \(needed), have \(available)"
         case .presetKindMismatch(let expected, let got):

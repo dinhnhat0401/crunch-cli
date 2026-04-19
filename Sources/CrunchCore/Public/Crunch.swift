@@ -4,6 +4,18 @@ import Foundation
 /// through `Crunch.compress(_:)` — concrete compressor implementations
 /// are internal and not addressable by callers.
 public enum Crunch {
+    /// Detect the file kind at `url` using the same rules `Crunch.compress`
+    /// applies internally. Use this to resolve a kind-agnostic
+    /// `ProfileName` to a concrete `Preset` before building a
+    /// `CompressionRequest` — the CLI and scripting callers rely on this
+    /// to avoid duplicating detection logic.
+    ///
+    /// Throws `CrunchError.sourceUnreadable` if the file can't be opened,
+    /// or `CrunchError.unsupportedFormat` if its kind can't be determined.
+    public static func detectKind(at url: URL) throws -> FileKind {
+        try FileKindDetector.detect(at: url)
+    }
+
     /// Compress a file according to `request`. Returns an
     /// `AsyncThrowingStream` that yields `.started`, zero or more
     /// `.progress` values, and exactly one `.finished` — or throws a
@@ -26,7 +38,8 @@ public enum Crunch {
                         )
                     }
 
-                    // 3. Resolve destination URL.
+                    // 3. Resolve destination URL. OutputNaming rejects paths
+                    //    that resolve to the source file itself.
                     let destination = try OutputNaming.resolve(
                         request.destination,
                         source: request.source

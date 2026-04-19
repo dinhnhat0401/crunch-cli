@@ -123,10 +123,12 @@ struct CompressCommand: AsyncParsableCommand {
         index: Int
     ) async -> FileOutcome {
         // Detection happens inside Core too, but we need the kind up front
-        // to resolve the profile → preset. A failure here is a core error.
+        // to resolve the profile → preset. Use the public CrunchCore API
+        // so CLI and library agree on detection rules — no duplicate
+        // heuristics.
         let detectedKind: FileKind
         do {
-            detectedKind = try publicDetect(at: sourceURL)
+            detectedKind = try Crunch.detectKind(at: sourceURL)
         } catch let error as CrunchError {
             reportError(error, sourceURL: sourceURL)
             return FileOutcome(succeeded: false, exitCode: exitCode(for: error))
@@ -223,49 +225,6 @@ struct CompressCommand: AsyncParsableCommand {
         }
     }
 
-    /// `FileKindDetector` is `internal`; we expose detection through a
-    /// tiny throwing call that mirrors the library's behaviour by running
-    /// a detect-only preflight via `Crunch.compress` is too heavy — instead
-    /// we rely on the same detection rules using public API here. Keep the
-    /// CLI-side detector to just parsing UTType + trivial extension sniff.
-    private func publicDetect(at url: URL) throws -> FileKind {
-        // We can't call the internal detector, so mimic its logic with the
-        // subset the CLI needs: extension + header sniff of the first bytes.
-        // Full detection happens inside `Crunch.compress` — this is only
-        // used to map ProfileName → Preset.kind ahead of time.
-        let ext = url.pathExtension.lowercased()
-        switch ext {
-        case "mp4", "mov", "m4v", "mkv", "webm", "avi":
-            return .video
-        case "jpg", "jpeg", "png", "heic", "tiff", "tif", "webp", "bmp", "gif":
-            return .image
-        case "pdf":
-            return .pdf
-        case "mp3", "wav", "aac", "m4a", "flac", "aiff", "aif", "ogg":
-            return .audio
-        default:
-            break
-        }
-        // Fallback: open & sniff the first 16 bytes.
-        guard let handle = try? FileHandle(forReadingFrom: url),
-              let data = try? handle.read(upToCount: 16) else {
-            throw CrunchError.unsupportedFormat(detected: ext.isEmpty ? "<no extension>" : ext)
-        }
-        defer { try? handle.close() }
-        let bytes = [UInt8](data)
-        if bytes.count >= 4 {
-            if bytes.starts(with: [0x25, 0x50, 0x44, 0x46]) { return .pdf }
-            if bytes.starts(with: [0xFF, 0xD8, 0xFF]) { return .image }
-            if bytes.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return .image }
-            if bytes.starts(with: [0x47, 0x49, 0x46, 0x38]) { return .image }
-            if bytes.starts(with: [0x49, 0x44, 0x33]) { return .audio }
-            if bytes.count >= 12 && Array(bytes[4..<8]) == [0x66, 0x74, 0x79, 0x70] {
-                return .video
-            }
-        }
-        throw CrunchError.unsupportedFormat(detected: ext.isEmpty ? "<no extension>" : ext)
-    }
-
     // MARK: - Error reporting + exit code mapping
 
     private func reportError(_ error: CrunchError, sourceURL: URL) {
@@ -284,7 +243,8 @@ struct CompressCommand: AsyncParsableCommand {
         case .unsupportedFormat:
             return 2
         case .sourceUnreadable, .destinationNotWritable,
-             .destinationAlreadyExists, .insufficientDiskSpace:
+             .destinationAlreadyExists, .destinationMatchesSource,
+             .insufficientDiskSpace:
             return 3
         case .compressionFailed:
             return 4

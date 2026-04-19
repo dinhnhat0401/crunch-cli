@@ -35,7 +35,10 @@ let package = Package(
         .testTarget(
             name: "CrunchCLITests",
             dependencies: ["crunch"],
-            path: "Tests/CrunchCLITests"
+            path: "Tests/CrunchCLITests",
+            resources: [
+                .copy("Fixtures"),
+            ]
         ),
     ]
 )
