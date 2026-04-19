@@ -40,6 +40,40 @@ enum OutputNaming {
         return candidate
     }
 
+    /// Library-managed output paths may need container normalization when the
+    /// engine owns the destination naming:
+    /// - audio always writes AAC in an M4A container
+    /// - video writes MP4/MOV/M4V only, so unsupported source extensions
+    ///   like `.avi` normalize to `.mp4`
+    ///
+    /// Explicit destinations are left untouched — callers own those paths.
+    static func normalizedAlongsideExtension(
+        for resolved: URL,
+        destination: CompressionRequest.Destination,
+        preset: Preset
+    ) -> URL {
+        guard case .alongsideSource = destination else {
+            return resolved
+        }
+
+        switch preset {
+        case .audio:
+            return resolved
+                .deletingPathExtension()
+                .appendingPathExtension("m4a")
+        case .video:
+            let ext = resolved.pathExtension.lowercased()
+            if ["mp4", "mov", "m4v"].contains(ext) {
+                return resolved
+            }
+            return resolved
+                .deletingPathExtension()
+                .appendingPathExtension("mp4")
+        case .image, .pdf:
+            return resolved
+        }
+    }
+
     /// Canonical absolute path for comparison. Uses `standardizedFileURL` +
     /// `resolvingSymlinksInPath` so `/tmp/foo.jpg`, `/private/tmp/foo.jpg`,
     /// and `./foo.jpg` all compare equal when they point at the same file.

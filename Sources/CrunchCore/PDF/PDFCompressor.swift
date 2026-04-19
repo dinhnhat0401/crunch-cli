@@ -38,7 +38,9 @@ import UniformTypeIdentifiers
 /// highQuality / tiny pair under-differentiate on image-heavy PDFs. We
 /// accept this trade rather than rasterize pages; losing text extraction
 /// would violate the SYSTEM-DESIGN §9.3 invariant that the legal /
-/// knowledge-worker personas depend on.
+/// knowledge-worker personas depend on. Grayscale conversion and font
+/// stripping are intentionally absent from the v1.0 public API until the
+/// lower-level `CGPDFContentStream` rewrite path exists to honor them.
 ///
 /// References:
 /// - SYSTEM-DESIGN §9.3 (PDF pipeline invariants — text preservation)

@@ -168,6 +168,33 @@ final class AudioCompressorTests: XCTestCase {
         )
     }
 
+    /// The library-owned "alongside source" destination should normalize
+    /// audio outputs to `.m4a` instead of preserving the source extension.
+    func testAudioAlongsideSourceUsesM4AExtension() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let source = dir.appendingPathComponent("in.wav")
+        try writeTestWAV(to: source, durationSeconds: 1.0, stereo: true)
+
+        let request = CompressionRequest(
+            source: source,
+            destination: .alongsideSource(suffix: "_crunched"),
+            preset: .audio(AudioPreset(profile: .balanced)),
+            commonOptions: .init(overwriteExisting: true, stripMetadata: false)
+        )
+
+        var finished: CompressionResult?
+        for try await event in Crunch.compress(request) {
+            if case .finished(let result) = event { finished = result }
+        }
+
+        let result = try XCTUnwrap(finished)
+        XCTAssertEqual(result.output.pathExtension, "m4a")
+        XCTAssertEqual(result.output.lastPathComponent, "in_crunched.m4a")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: result.output.path))
+    }
+
     /// Balanced preset on a 3-second source should produce a file
     /// substantially smaller than raw PCM — 128 kbps × 3 s ≈ 48 KB +
     /// container overhead, so < 200 KB is a loose-but-meaningful bound.
@@ -427,42 +454,4 @@ final class AudioCompressorTests: XCTestCase {
         }
     }
 
-    /// AVFoundation doesn't ship an MP3 encoder on macOS. Requests for the
-    /// `.mp3` codec must fail fast with a clear error mentioning MP3 —
-    /// never silently fall back to AAC/M4A (which would betray the caller).
-    func testAudioMP3CodecRequestThrowsClearError() async throws {
-        let dir = try makeTempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
-
-        let source = dir.appendingPathComponent("in.wav")
-        let output = dir.appendingPathComponent("out.mp3")
-        try writeTestWAV(to: source, durationSeconds: 1.0, stereo: true)
-
-        let request = CompressionRequest(
-            source: source,
-            destination: .explicit(output),
-            preset: .audio(AudioPreset(profile: .balanced, codec: .mp3)),
-            commonOptions: .init(overwriteExisting: true, stripMetadata: false)
-        )
-
-        do {
-            for try await _ in Crunch.compress(request) {}
-            XCTFail("expected .compressionFailed for MP3 codec request")
-        } catch let error as CrunchError {
-            guard case .compressionFailed(let kind, let underlying) = error else {
-                return XCTFail("expected .compressionFailed, got \(error)")
-            }
-            XCTAssertEqual(kind, .audio)
-            let message = (underlying as NSError).localizedDescription
-            XCTAssertTrue(
-                message.localizedCaseInsensitiveContains("mp3"),
-                "error message should mention MP3, got: \(message)"
-            )
-        }
-
-        XCTAssertFalse(
-            FileManager.default.fileExists(atPath: output.path),
-            "no output file should be written when MP3 is rejected"
-        )
-    }
 }

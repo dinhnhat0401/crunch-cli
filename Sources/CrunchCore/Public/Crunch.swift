@@ -40,9 +40,14 @@ public enum Crunch {
 
                     // 3. Resolve destination URL. OutputNaming rejects paths
                     //    that resolve to the source file itself.
-                    let destination = try OutputNaming.resolve(
+                    let resolvedDestination = try OutputNaming.resolve(
                         request.destination,
                         source: request.source
+                    )
+                    let destination = OutputNaming.normalizedAlongsideExtension(
+                        for: resolvedDestination,
+                        destination: request.destination,
+                        preset: request.preset
                     )
 
                     // 4. Dispatch on the preset sum. Each case carries the

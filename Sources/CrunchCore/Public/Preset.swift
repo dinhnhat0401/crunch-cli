@@ -109,30 +109,20 @@ public struct PDFPreset: Sendable, Hashable {
         case balanced
         /// 72 DPI images — quick sharing.
         case smallFile
-        /// 50 DPI grayscale — maximum compression.
+        /// Most aggressive PDFKit-backed image optimization path.
         case tiny
     }
 
     /// The selected quality profile.
     public var profile: Profile
-    /// Convert embedded images to grayscale.
-    public var convertToGrayscale: Bool
-    /// Strip embedded fonts (tiny profile only; app gates this).
-    public var stripEmbeddedFonts: Bool
 
     /// Create a PDF preset with defaults suitable for most callers.
-    public init(
-        profile: Profile = .balanced,
-        convertToGrayscale: Bool = false,
-        stripEmbeddedFonts: Bool = false
-    ) {
+    public init(profile: Profile = .balanced) {
         self.profile = profile
-        self.convertToGrayscale = convertToGrayscale
-        self.stripEmbeddedFonts = stripEmbeddedFonts
     }
 }
 
-/// Audio compression preset.
+/// Audio compression preset. v1.0 outputs AAC in an M4A container.
 public struct AudioPreset: Sendable, Hashable {
     /// Quality profiles available for audio.
     public enum Profile: Sendable, Hashable {
@@ -146,22 +136,11 @@ public struct AudioPreset: Sendable, Hashable {
         case tiny
     }
 
-    /// Output audio codec.
-    public enum Codec: Sendable, Hashable {
-        /// AAC in an M4A container — default.
-        case aac
-        /// MP3 — fallback for MP3-in / MP3-out preservation.
-        case mp3
-    }
-
     /// The selected quality profile.
     public var profile: Profile
-    /// Output codec.
-    public var codec: Codec
 
     /// Create an audio preset with defaults suitable for most callers.
-    public init(profile: Profile = .balanced, codec: Codec = .aac) {
+    public init(profile: Profile = .balanced) {
         self.profile = profile
-        self.codec = codec
     }
 }

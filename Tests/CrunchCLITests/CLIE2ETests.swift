@@ -5,15 +5,24 @@
 // shell script or CI step would hit them.
 
 import XCTest
+import AVFoundation
+import CoreVideo
 
 final class CLIE2ETests: XCTestCase {
 
     // MARK: - Locate the built binary
 
     /// Walk up from the test source file until we find a sibling
-    /// `.build/debug/crunch`. `swift test` always builds the CLI target
-    /// first because `CrunchCLITests` depends on it.
+    /// `.build/debug/crunch`. Prefer the binary beside the current test
+    /// bundle first so `--scratch-path` runs do not accidentally execute a
+    /// stale repo-local build.
     private static var binaryURL: URL = {
+        let bundleDir = Bundle(for: CLIE2ETests.self).bundleURL.deletingLastPathComponent()
+        let bundledCandidate = bundleDir.appendingPathComponent("crunch")
+        if FileManager.default.isExecutableFile(atPath: bundledCandidate.path) {
+            return bundledCandidate
+        }
+
         var dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
         while dir.path != "/" {
             let candidate = dir.appendingPathComponent(".build/debug/crunch")
@@ -76,6 +85,111 @@ final class CLIE2ETests: XCTestCase {
         )
     }
 
+    private func writeTestVideo(
+        to url: URL,
+        size: CGSize = CGSize(width: 640, height: 360)
+    ) async throws {
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let input = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: Int(size.width),
+                AVVideoHeightKey: Int(size.height),
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: 8_000_000,
+                ],
+            ]
+        )
+        input.expectsMediaDataInRealTime = false
+
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA),
+                kCVPixelBufferWidthKey as String: Int(size.width),
+                kCVPixelBufferHeightKey as String: Int(size.height),
+            ]
+        )
+
+        guard writer.canAdd(input) else {
+            throw NSError(domain: "CLIE2ETests", code: 1)
+        }
+        writer.add(input)
+
+        guard writer.startWriting() else {
+            throw writer.error ?? NSError(domain: "CLIE2ETests", code: 2)
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        guard let pool = adaptor.pixelBufferPool else {
+            throw NSError(domain: "CLIE2ETests", code: 3)
+        }
+
+        for (index, time) in stride(from: 0.0, to: 1.0, by: 1.0 / 30.0).enumerated() {
+            while !input.isReadyForMoreMediaData {
+                await Task.yield()
+            }
+
+            let pixelBuffer = try makePixelBuffer(
+                from: pool,
+                width: Int(size.width),
+                height: Int(size.height),
+                red: UInt8((index * 37) % 255),
+                green: UInt8((index * 71) % 255),
+                blue: UInt8((index * 103) % 255)
+            )
+
+            guard adaptor.append(
+                pixelBuffer,
+                withPresentationTime: CMTime(seconds: time, preferredTimescale: 600)
+            ) else {
+                throw writer.error ?? NSError(domain: "CLIE2ETests", code: 4)
+            }
+        }
+
+        input.markAsFinished()
+        await writer.finishWriting()
+        if writer.status != .completed {
+            throw writer.error ?? NSError(domain: "CLIE2ETests", code: 5)
+        }
+    }
+
+    private func makePixelBuffer(
+        from pool: CVPixelBufferPool,
+        width: Int,
+        height: Int,
+        red: UInt8,
+        green: UInt8,
+        blue: UInt8
+    ) throws -> CVPixelBuffer {
+        var pixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBuffer)
+        guard status == kCVReturnSuccess, let pixelBuffer else {
+            throw NSError(domain: "CLIE2ETests", code: 6)
+        }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+            throw NSError(domain: "CLIE2ETests", code: 7)
+        }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let ptr = base.assumingMemoryBound(to: UInt8.self)
+        for y in 0 ..< height {
+            let row = ptr.advanced(by: y * bytesPerRow)
+            for x in 0 ..< width {
+                let offset = x * 4
+                row[offset + 0] = blue
+                row[offset + 1] = green
+                row[offset + 2] = red
+                row[offset + 3] = 255
+            }
+        }
+        return pixelBuffer
+    }
+
     // MARK: - Happy path
 
     /// `crunch fixture.jpg -o out.jpg --overwrite` exits 0 and produces a
@@ -119,6 +233,23 @@ final class CLIE2ETests: XCTestCase {
             FileManager.default.fileExists(atPath: expected.path),
             "expected default output at \(expected.path)"
         )
+    }
+
+    func testCLICompressesVideoWithExplicitOutput() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let source = dir.appendingPathComponent("clip.mp4")
+        let output = dir.appendingPathComponent("clip-out.mp4")
+        try await writeTestVideo(to: source)
+
+        let result = try runCLI([
+            source.path, "-o", output.path,
+            "--preset", "balanced", "--overwrite", "--quiet",
+        ])
+
+        XCTAssertEqual(result.exitCode, 0, "stderr:\n\(result.stderr)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
     }
 
     // MARK: - Error-path exit-code contract (SYSTEM-DESIGN §10.3)

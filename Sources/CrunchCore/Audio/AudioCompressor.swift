@@ -17,15 +17,8 @@ import CoreMedia
 /// `AVNumberOfChannelsKey: 1` plus a matching mono
 /// `AVChannelLayoutKey`; the reader side still decodes the source's native
 /// channel layout and hands it to the encoder as LPCM.
-///
-/// ## MP3 output is rejected
-///
-/// AVFoundation ships an MP3 *decoder* on macOS but not an MP3 *encoder* —
-/// `AVAssetWriter` does not accept the MP3 file type for new files.
-/// Requests with `AudioPreset.codec == .mp3` therefore throw
-/// `CrunchError.compressionFailed(kind: .audio, ...)` with a message
-/// surfacing this limitation, rather than silently substituting AAC/M4A.
-/// The AAC/M4A default covers every supported profile.
+/// v1.0 intentionally exposes only this AAC/M4A pathway; MP3 output is not
+/// part of the public API because AVFoundation on macOS cannot encode it.
 struct AudioCompressor: Compressor {
     typealias KindPreset = AudioPreset
 
@@ -50,16 +43,6 @@ struct AudioCompressor: Compressor {
                 }
 
                 do {
-                    // Reject MP3 encode requests up-front, before any I/O —
-                    // AVFoundation can't honour them on macOS (see the
-                    // type-level doc comment for why).
-                    if preset.codec == .mp3 {
-                        throw CrunchError.compressionFailed(
-                            kind: .audio,
-                            underlying: AudioEncodeError.mp3NotSupported
-                        )
-                    }
-
                     // Honour overwriteExisting up front.
                     if FileManager.default.fileExists(atPath: destination.path)
                         && !commonOptions.overwriteExisting {
@@ -416,7 +399,6 @@ private actor PTSBox {
 /// to re-throw directly. Wrapped inside `CrunchError.compressionFailed`
 /// before leaving the module.
 enum AudioEncodeError: Error, LocalizedError {
-    case mp3NotSupported
     case noAudioTrack
     case zeroDuration
     case readerRejectedOutput
@@ -429,8 +411,6 @@ enum AudioEncodeError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .mp3NotSupported:
-            return "MP3 encoding not supported by AVFoundation on macOS — use the default AAC/M4A output"
         case .noAudioTrack:
             return "source file contains no audio track"
         case .zeroDuration:
