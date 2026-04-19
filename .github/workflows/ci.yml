@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: swift --version
+
+      - name: Build (debug)
+        run: swift build -c debug
+
+      - name: Test
+        run: swift test
+
+      - name: Forbidden imports lint
+        run: ./scripts/forbidden-imports-lint.sh
