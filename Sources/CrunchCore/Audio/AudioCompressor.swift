@@ -52,6 +52,10 @@ struct AudioCompressor: Compressor {
                     let sourceBytes = try AudioCompressor.byteCount(of: source)
                     continuation.yield(.started(expectedSourceBytes: sourceBytes))
                     continuation.yield(.progress(fraction: 0.0))
+                    try DiskSpaceGuard.assertSufficientSpace(
+                        at: destination,
+                        requiredBytes: max(sourceBytes, 8 * 1024 * 1024)
+                    )
 
                     // Open source, locate the audio track.
                     let asset = AVURLAsset(url: source)
@@ -240,6 +244,17 @@ struct AudioCompressor: Compressor {
                         throw CrunchError.compressionFailed(kind: .audio, underlying: underlying)
                     }
 
+                    let finalOutputBytes = try OutputPreserver.replaceWithSourceIfLarger(
+                        source: source,
+                        candidate: tmpURL,
+                        sourceBytes: sourceBytes,
+                        sourceExtension: source.pathExtension,
+                        candidateExtension: "m4a",
+                        stripMetadata: commonOptions.stripMetadata,
+                        allowsPassthrough: source.pathExtension.lowercased() == "m4a"
+                            && (profile == .balanced || profile == .highQuality)
+                    )
+
                     // Stop the progress task and emit final 1.0 before
                     // moving the file into place.
                     progressTask.cancel()
@@ -250,13 +265,12 @@ struct AudioCompressor: Compressor {
                     // Atomic replace into destination.
                     try AudioCompressor.atomicallyMove(from: tmpURL, to: destination)
 
-                    let outputBytes = try AudioCompressor.byteCount(of: destination)
                     let duration = ContinuousClock.now - start
                     let result = CompressionResult(
                         source: source,
                         output: destination,
                         sourceBytes: sourceBytes,
-                        outputBytes: outputBytes,
+                        outputBytes: finalOutputBytes,
                         duration: duration,
                         kind: .audio
                     )

@@ -79,6 +79,10 @@ struct PDFCompressor: Compressor {
                     let sourceBytes = try PDFCompressor.byteCount(of: source)
                     continuation.yield(.started(expectedSourceBytes: sourceBytes))
                     continuation.yield(.progress(fraction: 0.0))
+                    try DiskSpaceGuard.assertSufficientSpace(
+                        at: destination,
+                        requiredBytes: max(sourceBytes, 16 * 1024 * 1024)
+                    )
 
                     guard let sourceDoc = PDFDocument(url: source) else {
                         throw CrunchError.sourceUnreadable(
@@ -144,17 +148,26 @@ struct PDFCompressor: Compressor {
                         throw CrunchError.destinationNotWritable(tmpURL)
                     }
 
+                    let finalOutputBytes = try OutputPreserver.replaceWithSourceIfLarger(
+                        source: source,
+                        candidate: tmpURL,
+                        sourceBytes: sourceBytes,
+                        sourceExtension: source.pathExtension,
+                        candidateExtension: "pdf",
+                        stripMetadata: commonOptions.stripMetadata,
+                        allowsPassthrough: true
+                    )
+
                     try Task.checkCancellation()
 
                     try PDFCompressor.atomicallyMove(from: tmpURL, to: destination)
 
-                    let outputBytes = try PDFCompressor.byteCount(of: destination)
                     let duration = ContinuousClock.now - start
                     let result = CompressionResult(
                         source: source,
                         output: destination,
                         sourceBytes: sourceBytes,
-                        outputBytes: outputBytes,
+                        outputBytes: finalOutputBytes,
                         duration: duration,
                         kind: .pdf
                     )

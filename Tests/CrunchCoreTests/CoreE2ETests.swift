@@ -85,12 +85,11 @@ final class CoreE2ETests: XCTestCase {
         }
     }
 
-    // MARK: - P2 regression: animated images are rejected, not silently copied
+    // MARK: - Animated images
 
-    /// Animated GIFs must throw `.unsupportedFormat(detected: "animated-gif")`
-    /// in v1.0 rather than silently passing bytes through — silent
-    /// pass-through would ignore caller-requested `stripMetadata` / `resize`.
-    func testAnimatedGIFIsRejected() async throws {
+    /// Animated GIFs are recompressed frame-by-frame. The output must
+    /// remain animated, preserve playback timing, and honour resize.
+    func testAnimatedGIFCompressesAndPreservesAnimationProperties() async throws {
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
 
@@ -101,24 +100,44 @@ final class CoreE2ETests: XCTestCase {
         let request = CompressionRequest(
             source: animated,
             destination: .explicit(output),
-            preset: .image(ImagePreset(profile: .balanced)),
+            preset: .image(ImagePreset(profile: .balanced, resize: .maxDimension(5))),
             commonOptions: .init(overwriteExisting: true, stripMetadata: true)
         )
 
-        do {
-            for try await _ in Crunch.compress(request) {}
-            XCTFail("expected .unsupportedFormat for animated GIF")
-        } catch let error as CrunchError {
-            guard case .unsupportedFormat(let detected) = error else {
-                return XCTFail("expected .unsupportedFormat, got \(error)")
+        var finished: CompressionResult?
+        var progressEvents = 0
+        for try await event in Crunch.compress(request) {
+            switch event {
+            case .started:
+                break
+            case .progress:
+                progressEvents += 1
+            case .finished(let result):
+                finished = result
             }
-            XCTAssertEqual(detected, "animated-gif")
         }
 
-        XCTAssertFalse(
-            FileManager.default.fileExists(atPath: output.path),
-            "no output file should be written when the input is rejected"
+        let result = try XCTUnwrap(finished)
+        XCTAssertEqual(result.kind, .image)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: output.path))
+        XCTAssertGreaterThanOrEqual(progressEvents, 2, "animated path should report per-frame progress")
+
+        let outputSource = try XCTUnwrap(CGImageSourceCreateWithURL(output as CFURL, nil))
+        XCTAssertEqual(CGImageSourceGetCount(outputSource), 2, "output should remain animated")
+
+        let topProps = CGImageSourceCopyProperties(outputSource, nil) as? [CFString: Any] ?? [:]
+        let gifProps = topProps[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+        XCTAssertEqual(gifProps?[kCGImagePropertyGIFLoopCount] as? Int, 0)
+
+        let frameProps = CGImageSourceCopyPropertiesAtIndex(outputSource, 0, nil) as? [CFString: Any] ?? [:]
+        XCTAssertEqual(frameProps[kCGImagePropertyPixelWidth] as? Int, 5)
+        XCTAssertEqual(frameProps[kCGImagePropertyPixelHeight] as? Int, 5)
+
+        let frameGIFProps = frameProps[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+        let delayTime = try XCTUnwrap(
+            (frameGIFProps?[kCGImagePropertyGIFDelayTime] as? NSNumber)?.doubleValue
         )
+        XCTAssertEqual(delayTime, 0.1, accuracy: 0.001)
     }
 
     /// Single-frame GIFs are treated as regular static images and compress

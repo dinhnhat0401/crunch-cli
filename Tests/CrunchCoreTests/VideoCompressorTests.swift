@@ -359,6 +359,43 @@ final class VideoCompressorTests: XCTestCase {
         XCTAssertEqual(audioTracks.count, 1)
     }
 
+    func testVideoBalancedDoesNotBloatAlreadyLowBitrateSource() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let source = dir.appendingPathComponent("source.mp4")
+        let output = dir.appendingPathComponent("out.mp4")
+        try await writeTestVideo(
+            to: source,
+            size: CGSize(width: 320, height: 180),
+            bitrate: 220_000,
+            frameTimes: stride(from: 0.0, to: 2.0, by: 1.0 / 12.0).map { $0 }
+        )
+
+        let sourceBytes = try (FileManager.default.attributesOfItem(
+            atPath: source.path
+        )[.size] as? NSNumber).map(\.int64Value) ?? 0
+
+        let request = CompressionRequest(
+            source: source,
+            destination: .explicit(output),
+            preset: .video(VideoPreset(profile: .balanced)),
+            commonOptions: .init(overwriteExisting: true, stripMetadata: false)
+        )
+
+        var finished: CompressionResult?
+        for try await event in Crunch.compress(request) {
+            if case .finished(let result) = event { finished = result }
+        }
+
+        let result = try XCTUnwrap(finished)
+        XCTAssertLessThanOrEqual(
+            result.outputBytes,
+            sourceBytes,
+            "balanced preset should not inflate an already low-bitrate source"
+        )
+    }
+
     func testVideoFullEventStreamOrdering() async throws {
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }

@@ -454,4 +454,48 @@ final class AudioCompressorTests: XCTestCase {
         }
     }
 
+    func testAudioBalancedDoesNotBloatExistingM4A() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let sourceWAV = dir.appendingPathComponent("seed.wav")
+        let sourceM4A = dir.appendingPathComponent("seed.m4a")
+        let output = dir.appendingPathComponent("out.m4a")
+        try writeTestWAV(to: sourceWAV, durationSeconds: 1.0, stereo: false)
+
+        let seedRequest = CompressionRequest(
+            source: sourceWAV,
+            destination: .explicit(sourceM4A),
+            preset: .audio(AudioPreset(profile: .tiny)),
+            commonOptions: .init(overwriteExisting: true, stripMetadata: false)
+        )
+        for try await _ in Crunch.compress(seedRequest) {}
+
+        let sourceBytes = try byteCount(of: sourceM4A)
+        let request = CompressionRequest(
+            source: sourceM4A,
+            destination: .explicit(output),
+            preset: .audio(AudioPreset(profile: .balanced)),
+            commonOptions: .init(overwriteExisting: true, stripMetadata: false)
+        )
+
+        var finished: CompressionResult?
+        for try await event in Crunch.compress(request) {
+            if case .finished(let result) = event { finished = result }
+        }
+
+        let result = try XCTUnwrap(finished)
+        XCTAssertLessThanOrEqual(result.outputBytes, sourceBytes)
+        XCTAssertEqual(
+            try byteCount(of: output),
+            sourceBytes,
+            "balanced audio should preserve an existing M4A when re-encoding would bloat it"
+        )
+    }
+
+    private func byteCount(of url: URL) throws -> Int64 {
+        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        return (attrs[.size] as? NSNumber)?.int64Value ?? 0
+    }
+
 }

@@ -244,6 +244,36 @@ final class PDFCompressorTests: XCTestCase {
         )
     }
 
+    func testPDFBalancedDoesNotBloatTextOnlySource() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let source = dir.appendingPathComponent("source.pdf")
+        let output = dir.appendingPathComponent("out.pdf")
+        try writeTestPDF(to: source, pages: 2, withImage: false)
+
+        let sourceBytes = try byteCount(of: source)
+        let request = CompressionRequest(
+            source: source,
+            destination: .explicit(output),
+            preset: .pdf(PDFPreset(profile: .balanced)),
+            commonOptions: .init(overwriteExisting: true, stripMetadata: false)
+        )
+
+        var finished: CompressionResult?
+        for try await event in Crunch.compress(request) {
+            if case .finished(let result) = event { finished = result }
+        }
+
+        let result = try XCTUnwrap(finished)
+        XCTAssertLessThanOrEqual(result.outputBytes, sourceBytes)
+        XCTAssertEqual(
+            try byteCount(of: output),
+            sourceBytes,
+            "text-only PDFs should preserve the original when recompression would bloat them"
+        )
+    }
+
     // MARK: - Metadata stripping
 
     func testPDFStripMetadataClearsAuthor() async throws {

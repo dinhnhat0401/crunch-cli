@@ -3,10 +3,10 @@ import ImageIO
 import CoreGraphics
 import UniformTypeIdentifiers
 
-/// Still-image compressor implementing the static ImageIO pipeline
-/// described in SYSTEM-DESIGN §9.2. Animated inputs are rejected in v1.0
-/// with `.unsupportedFormat(detected: "animated-<format>")`; per-frame
-/// recompression is planned for v1.1.
+/// Image compressor backed by ImageIO. Static images are re-encoded as a
+/// single frame; animated inputs are decoded and re-encoded frame-by-frame
+/// so `resize` / metadata stripping / preset-driven quality apply to the
+/// whole sequence rather than failing or silently copying bytes through.
 struct ImageCompressor: Compressor {
     typealias KindPreset = ImagePreset
 
@@ -39,6 +39,10 @@ struct ImageCompressor: Compressor {
                     let sourceBytes = try ImageCompressor.byteCount(of: source)
                     continuation.yield(.started(expectedSourceBytes: sourceBytes))
                     continuation.yield(.progress(fraction: 0.0))
+                    try DiskSpaceGuard.assertSufficientSpace(
+                        at: destination,
+                        requiredBytes: max(sourceBytes, 8 * 1024 * 1024)
+                    )
 
                     guard let src = CGImageSourceCreateWithURL(source as CFURL, nil) else {
                         throw CrunchError.sourceUnreadable(underlying: ImageIOError.cannotOpenSource)
@@ -50,38 +54,53 @@ struct ImageCompressor: Compressor {
                         properties: topProps,
                         frameCount: frameCount
                     )
+                    let typeID = CGImageSourceGetType(src) ?? (UTType.jpeg.identifier as CFString)
 
                     try Task.checkCancellation()
 
-                    // v1.0: reject animated inputs. Per-frame recompression is v1.1
-                    // (SYSTEM-DESIGN §9.2 Option B). A silent byte-copy would
-                    // ignore user-requested `resize` / `stripMetadata` / preset
-                    // quality — we'd rather surface an honest error than lie
-                    // about having honoured the request.
                     if let format = animationFormat {
-                        throw CrunchError.unsupportedFormat(detected: "animated-\(format)")
+                        try ImageCompressor.writeAnimated(
+                            source: src,
+                            tmpURL: tmpURL,
+                            destinationTypeID: typeID,
+                            frameCount: frameCount,
+                            format: format,
+                            preset: preset,
+                            commonOptions: commonOptions
+                        ) { fraction in
+                            continuation.yield(.progress(fraction: fraction))
+                        }
+                    } else {
+                        try ImageCompressor.writeStatic(
+                            source: src,
+                            tmpURL: tmpURL,
+                            destinationTypeID: typeID,
+                            preset: preset,
+                            commonOptions: commonOptions
+                        )
                     }
 
-                    try ImageCompressor.writeStatic(
-                        source: src,
-                        sourceURL: source,
-                        tmpURL: tmpURL,
-                        preset: preset,
-                        commonOptions: commonOptions
-                    )
-
                     try Task.checkCancellation()
+
+                    let finalOutputBytes = try OutputPreserver.replaceWithSourceIfLarger(
+                        source: source,
+                        candidate: tmpURL,
+                        sourceBytes: sourceBytes,
+                        sourceExtension: source.pathExtension,
+                        candidateExtension: source.pathExtension,
+                        stripMetadata: commonOptions.stripMetadata,
+                        allowsPassthrough: preset.resize == nil
+                    )
 
                     // Atomic replace into destination.
                     try ImageCompressor.atomicallyMove(from: tmpURL, to: destination)
 
-                    let outputBytes = try ImageCompressor.byteCount(of: destination)
                     let duration = ContinuousClock.now - start
                     let result = CompressionResult(
                         source: source,
                         output: destination,
                         sourceBytes: sourceBytes,
-                        outputBytes: outputBytes,
+                        outputBytes: finalOutputBytes,
                         duration: duration,
                         kind: .image
                     )
@@ -111,17 +130,14 @@ struct ImageCompressor: Compressor {
 
     private static func writeStatic(
         source: CGImageSource,
-        sourceURL: URL,
         tmpURL: URL,
+        destinationTypeID: CFString,
         preset: ImagePreset,
         commonOptions: CompressionRequest.CommonOptions
     ) throws {
-        // Prefer the source type; fall back to JPEG if ImageIO can't name it.
-        let typeID: CFString = CGImageSourceGetType(source) ?? (UTType.jpeg.identifier as CFString)
-
         guard let destination = CGImageDestinationCreateWithURL(
             tmpURL as CFURL,
-            typeID,
+            destinationTypeID,
             1,
             nil
         ) else {
@@ -133,25 +149,7 @@ struct ImageCompressor: Compressor {
             kCGImageDestinationLossyCompressionQuality: quality,
         ]
 
-        // Resize via the thumbnail API — documented memory-efficient path.
-        let image: CGImage
-        if let resize = preset.resize {
-            let maxDim = resolveMaxDimension(resize: resize, source: source)
-            let thumbnailOptions: [CFString: Any] = [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: maxDim,
-            ]
-            guard let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) else {
-                throw CrunchError.compressionFailed(kind: .image, underlying: ImageIOError.thumbnailFailed)
-            }
-            image = thumb
-        } else {
-            guard let full = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-                throw CrunchError.compressionFailed(kind: .image, underlying: ImageIOError.decodeFailed)
-            }
-            image = full
-        }
+        let image = try decodeImage(at: 0, from: source, resize: preset.resize)
 
         if !commonOptions.stripMetadata {
             if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] {
@@ -168,6 +166,57 @@ struct ImageCompressor: Compressor {
         }
     }
 
+    private static func writeAnimated(
+        source: CGImageSource,
+        tmpURL: URL,
+        destinationTypeID: CFString,
+        frameCount: Int,
+        format: AnimatedFormat,
+        preset: ImagePreset,
+        commonOptions: CompressionRequest.CommonOptions,
+        emitProgress: (Double) -> Void
+    ) throws {
+        guard let destination = CGImageDestinationCreateWithURL(
+            tmpURL as CFURL,
+            destinationTypeID,
+            frameCount,
+            nil
+        ) else {
+            throw CrunchError.destinationNotWritable(tmpURL)
+        }
+
+        let sourceProperties = CGImageSourceCopyProperties(source, nil) as? [CFString: Any] ?? [:]
+        let destinationProperties = animationContainerProperties(
+            from: sourceProperties,
+            format: format,
+            stripMetadata: commonOptions.stripMetadata
+        )
+        if !destinationProperties.isEmpty {
+            CGImageDestinationSetProperties(destination, destinationProperties as CFDictionary)
+        }
+
+        let quality = qualityValue(for: preset.profile)
+        for index in 0 ..< frameCount {
+            try Task.checkCancellation()
+
+            let image = try decodeImage(at: index, from: source, resize: preset.resize)
+            let frameProps = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any] ?? [:]
+            var destinationFrameProps = animationFrameProperties(
+                from: frameProps,
+                format: format,
+                stripMetadata: commonOptions.stripMetadata
+            )
+            destinationFrameProps[kCGImageDestinationLossyCompressionQuality] = quality
+            CGImageDestinationAddImage(destination, image, destinationFrameProps as CFDictionary)
+
+            emitProgress(Double(index + 1) / Double(frameCount) * 0.95)
+        }
+
+        guard CGImageDestinationFinalize(destination) else {
+            throw CrunchError.compressionFailed(kind: .image, underlying: ImageIOError.finalizeFailed)
+        }
+    }
+
     private static func qualityValue(for profile: ImagePreset.Profile) -> CGFloat {
         switch profile {
         case .highQuality: return 0.9
@@ -177,13 +226,17 @@ struct ImageCompressor: Compressor {
         }
     }
 
-    private static func resolveMaxDimension(resize: ImagePreset.Resize, source: CGImageSource) -> Int {
+    private static func resolveMaxDimension(
+        resize: ImagePreset.Resize,
+        source: CGImageSource,
+        index: Int = 0
+    ) -> Int {
         switch resize {
         case .maxDimension(let px):
             return max(1, px)
         case .percentage(let factor):
             let clamped = max(0.01, min(1.0, factor))
-            guard let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+            guard let props = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
                   let width = props[kCGImagePropertyPixelWidth] as? Int,
                   let height = props[kCGImagePropertyPixelHeight] as? Int else {
                 return 1024
@@ -192,24 +245,101 @@ struct ImageCompressor: Compressor {
         }
     }
 
+    private static func decodeImage(
+        at index: Int,
+        from source: CGImageSource,
+        resize: ImagePreset.Resize?
+    ) throws -> CGImage {
+        if let resize {
+            let maxDim = resolveMaxDimension(
+                resize: resize,
+                source: source,
+                index: index
+            )
+            let thumbnailOptions: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxDim,
+            ]
+            guard let thumb = CGImageSourceCreateThumbnailAtIndex(
+                source,
+                index,
+                thumbnailOptions as CFDictionary
+            ) else {
+                throw CrunchError.compressionFailed(
+                    kind: .image,
+                    underlying: ImageIOError.thumbnailFailed
+                )
+            }
+            return thumb
+        }
+
+        guard let full = CGImageSourceCreateImageAtIndex(source, index, nil) else {
+            throw CrunchError.compressionFailed(kind: .image, underlying: ImageIOError.decodeFailed)
+        }
+        return full
+    }
+
     // MARK: - Animated detection
 
-    /// Returns the short format name (`"gif"`, `"apng"`, `"webp"`, `"heics"`)
-    /// if the properties describe an animated image with `frameCount > 1`,
-    /// otherwise `nil`. APNG rides on the PNG property dictionary — a
+    /// Returns the animated container format if the properties describe a
+    /// multi-frame image. APNG rides on the PNG property dictionary — a
     /// multi-frame PNG is animated by definition.
     private static func animatedFormat(
         properties: [CFString: Any],
         frameCount: Int
-    ) -> String? {
+    ) -> AnimatedFormat? {
         guard frameCount > 1 else { return nil }
-        if properties[kCGImagePropertyGIFDictionary] != nil { return "gif" }
-        if properties[kCGImagePropertyPNGDictionary] != nil { return "apng" }
-        if properties[kCGImagePropertyHEICSDictionary] != nil { return "heics" }
+        if properties[kCGImagePropertyGIFDictionary] != nil { return .gif }
+        if properties[kCGImagePropertyPNGDictionary] != nil { return .apng }
+        if properties[kCGImagePropertyHEICSDictionary] != nil { return .heics }
         if #available(macOS 14.0, *) {
-            if properties[kCGImagePropertyWebPDictionary] != nil { return "webp" }
+            if properties[kCGImagePropertyWebPDictionary] != nil { return .webp }
         }
         return nil
+    }
+
+    private static func animationContainerProperties(
+        from properties: [CFString: Any],
+        format: AnimatedFormat,
+        stripMetadata: Bool
+    ) -> [CFString: Any] {
+        if !stripMetadata {
+            return properties.filter { !$0.key.isDestinationConfigKey }
+        }
+
+        guard let sourceAnimation = properties[format.propertyDictionaryKey] as? [CFString: Any] else {
+            return [:]
+        }
+
+        var animation: [CFString: Any] = [:]
+        if let loopCount = sourceAnimation[format.loopCountKey] {
+            animation[format.loopCountKey] = loopCount
+        }
+        return animation.isEmpty ? [:] : [format.propertyDictionaryKey: animation]
+    }
+
+    private static func animationFrameProperties(
+        from properties: [CFString: Any],
+        format: AnimatedFormat,
+        stripMetadata: Bool
+    ) -> [CFString: Any] {
+        var result = stripMetadata ? [:] : properties.filter { !$0.key.isDestinationConfigKey }
+        guard let sourceAnimation = properties[format.propertyDictionaryKey] as? [CFString: Any] else {
+            return result
+        }
+
+        var animation = (result[format.propertyDictionaryKey] as? [CFString: Any]) ?? [:]
+        if let delay = sourceAnimation[format.delayTimeKey] {
+            animation[format.delayTimeKey] = delay
+        }
+        if let unclampedDelay = sourceAnimation[format.unclampedDelayTimeKey] {
+            animation[format.unclampedDelayTimeKey] = unclampedDelay
+        }
+        if !animation.isEmpty {
+            result[format.propertyDictionaryKey] = animation
+        }
+        return result
     }
 
     // MARK: - Filesystem helpers
@@ -258,6 +388,65 @@ private enum ImageIOError: Error {
     case thumbnailFailed
     case decodeFailed
     case finalizeFailed
+}
+
+private enum AnimatedFormat {
+    case gif
+    case apng
+    case heics
+    case webp
+
+    var propertyDictionaryKey: CFString {
+        switch self {
+        case .gif:
+            return kCGImagePropertyGIFDictionary
+        case .apng:
+            return kCGImagePropertyPNGDictionary
+        case .heics:
+            return kCGImagePropertyHEICSDictionary
+        case .webp:
+            return kCGImagePropertyWebPDictionary
+        }
+    }
+
+    var loopCountKey: CFString {
+        switch self {
+        case .gif:
+            return kCGImagePropertyGIFLoopCount
+        case .apng:
+            return kCGImagePropertyAPNGLoopCount
+        case .heics:
+            return kCGImagePropertyHEICSLoopCount
+        case .webp:
+            return kCGImagePropertyWebPLoopCount
+        }
+    }
+
+    var delayTimeKey: CFString {
+        switch self {
+        case .gif:
+            return kCGImagePropertyGIFDelayTime
+        case .apng:
+            return kCGImagePropertyAPNGDelayTime
+        case .heics:
+            return kCGImagePropertyHEICSDelayTime
+        case .webp:
+            return kCGImagePropertyWebPDelayTime
+        }
+    }
+
+    var unclampedDelayTimeKey: CFString {
+        switch self {
+        case .gif:
+            return kCGImagePropertyGIFUnclampedDelayTime
+        case .apng:
+            return kCGImagePropertyAPNGUnclampedDelayTime
+        case .heics:
+            return kCGImagePropertyHEICSUnclampedDelayTime
+        case .webp:
+            return kCGImagePropertyWebPUnclampedDelayTime
+        }
+    }
 }
 
 private extension CFString {

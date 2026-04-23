@@ -49,6 +49,10 @@ struct VideoCompressor: Compressor {
                     let sourceBytes = try VideoCompressor.byteCount(of: source)
                     continuation.yield(.started(expectedSourceBytes: sourceBytes))
                     continuation.yield(.progress(fraction: 0.0))
+                    try DiskSpaceGuard.assertSufficientSpace(
+                        at: destination,
+                        requiredBytes: max(sourceBytes, 64 * 1024 * 1024)
+                    )
 
                     let container = try VideoCompressor.outputContainer(for: destination)
                     let localTmpURL = tmpDir
@@ -110,15 +114,49 @@ struct VideoCompressor: Compressor {
                         sourceAudioFormat = nil
                     }
 
+                    let sourceBitrate = try await VideoCompressor.sourceBitrate(
+                        videoTrack: videoTrack,
+                        audioTrack: audioTracks.first,
+                        sourceBytes: sourceBytes,
+                        sourceDuration: sourceDuration
+                    )
+
                     let plan = try VideoCompressor.encodingPlan(
                         for: preset,
                         sourceSize: sourceSize,
                         sourceDuration: sourceDuration,
-                        sourceAudioFormat: sourceAudioFormat
+                        sourceAudioFormat: sourceAudioFormat,
+                        sourceBitrate: sourceBitrate
                     )
 
                     if plan.initialProgress > 0 {
                         continuation.yield(.progress(fraction: plan.initialProgress))
+                    }
+
+                    if VideoCompressor.shouldPassthroughSource(
+                        source: source,
+                        destinationContainer: container,
+                        sourceSize: sourceSize,
+                        plan: plan,
+                        sourceBitrate: sourceBitrate,
+                        preset: preset,
+                        commonOptions: commonOptions
+                    ) {
+                        try FileManager.default.copyItem(at: source, to: localTmpURL)
+                        continuation.yield(.progress(fraction: 1.0))
+                        try VideoCompressor.atomicallyMove(from: localTmpURL, to: destination)
+
+                        let result = CompressionResult(
+                            source: source,
+                            output: destination,
+                            sourceBytes: sourceBytes,
+                            outputBytes: sourceBytes,
+                            duration: ContinuousClock.now - start,
+                            kind: .video
+                        )
+                        continuation.yield(.finished(result))
+                        continuation.finish()
+                        return
                     }
 
                     do {
@@ -417,6 +455,16 @@ struct VideoCompressor: Compressor {
         let videoFloorKbps: Int
     }
 
+    private struct SourceBitrate {
+        let videoBitsPerSecond: Double?
+        let audioBitsPerSecond: Double?
+
+        var totalBitsPerSecond: Double? {
+            let sum = (videoBitsPerSecond ?? 0) + (audioBitsPerSecond ?? 0)
+            return sum > 0 ? sum : nil
+        }
+    }
+
     private static let emailFriendlyTiers: [EmailFriendlyTier] = [
         .init(boundingBox: CGSize(width: 1920, height: 1080), audioKbps: 128, audioMono: false, videoFloorKbps: 1500),
         .init(boundingBox: CGSize(width: 1920, height: 1080), audioKbps: 128, audioMono: false, videoFloorKbps: 800),
@@ -430,7 +478,8 @@ struct VideoCompressor: Compressor {
         for preset: VideoPreset,
         sourceSize: CGSize,
         sourceDuration: TimeInterval,
-        sourceAudioFormat: (sampleRate: Double, channels: Int)?
+        sourceAudioFormat: (sampleRate: Double, channels: Int)?,
+        sourceBitrate: SourceBitrate?
     ) throws -> EncodingPlan {
         let hasAudio = sourceAudioFormat != nil
         let sourceChannels = sourceAudioFormat?.channels ?? 0
@@ -438,45 +487,63 @@ struct VideoCompressor: Compressor {
         switch preset.profile {
         case .highQuality:
             let targetSize = evenSize(sourceSize)
+            let audioBitrate = hasAudio ? 192_000 : nil
             return EncodingPlan(
                 targetSize: targetSize,
-                videoBitrate: scaledBitrate(
-                    for: targetSize,
-                    baseAt1080p: 10_000_000,
-                    min: 4_000_000,
-                    max: 16_000_000
+                videoBitrate: cappedVideoBitrate(
+                    desiredVideoBitrate: scaledBitrate(
+                        for: targetSize,
+                        baseAt1080p: 10_000_000,
+                        min: 4_000_000,
+                        max: 16_000_000
+                    ),
+                    audioBitrate: audioBitrate,
+                    sourceBitrate: sourceBitrate,
+                    profile: .highQuality
                 ),
-                audioBitrate: hasAudio ? 192_000 : nil,
+                audioBitrate: audioBitrate,
                 audioChannels: hasAudio ? max(1, min(2, sourceChannels)) : nil,
                 initialProgress: 0.0
             )
 
         case .balanced:
             let targetSize = fittedSize(sourceSize, landscapeBoundingBox: CGSize(width: 1920, height: 1080))
+            let audioBitrate = hasAudio ? 128_000 : nil
             return EncodingPlan(
                 targetSize: targetSize,
-                videoBitrate: scaledBitrate(
-                    for: targetSize,
-                    baseAt1080p: 5_000_000,
-                    min: 1_500_000,
-                    max: 8_000_000
+                videoBitrate: cappedVideoBitrate(
+                    desiredVideoBitrate: scaledBitrate(
+                        for: targetSize,
+                        baseAt1080p: 5_000_000,
+                        min: 1_500_000,
+                        max: 8_000_000
+                    ),
+                    audioBitrate: audioBitrate,
+                    sourceBitrate: sourceBitrate,
+                    profile: .balanced
                 ),
-                audioBitrate: hasAudio ? 128_000 : nil,
+                audioBitrate: audioBitrate,
                 audioChannels: hasAudio ? max(1, min(2, sourceChannels)) : nil,
                 initialProgress: 0.0
             )
 
         case .tiny:
             let targetSize = fittedSize(sourceSize, landscapeBoundingBox: CGSize(width: 1280, height: 720))
+            let audioBitrate = hasAudio ? 64_000 : nil
             return EncodingPlan(
                 targetSize: targetSize,
-                videoBitrate: scaledBitrate(
-                    for: targetSize,
-                    baseAt1080p: 1_500_000,
-                    min: 500_000,
-                    max: 2_000_000
+                videoBitrate: cappedVideoBitrate(
+                    desiredVideoBitrate: scaledBitrate(
+                        for: targetSize,
+                        baseAt1080p: 1_500_000,
+                        min: 500_000,
+                        max: 2_000_000
+                    ),
+                    audioBitrate: audioBitrate,
+                    sourceBitrate: sourceBitrate,
+                    profile: .tiny
                 ),
-                audioBitrate: hasAudio ? 64_000 : nil,
+                audioBitrate: audioBitrate,
                 audioChannels: hasAudio ? 1 : nil,
                 initialProgress: 0.0
             )
@@ -494,7 +561,12 @@ struct VideoCompressor: Compressor {
                 if videoBps >= Double(tier.videoFloorKbps) * 1000.0 {
                     return EncodingPlan(
                         targetSize: fittedSize(sourceSize, landscapeBoundingBox: tier.boundingBox),
-                        videoBitrate: Int(videoBps.rounded(.down)),
+                        videoBitrate: cappedVideoBitrate(
+                            desiredVideoBitrate: Int(videoBps.rounded(.down)),
+                            audioBitrate: hasAudio ? tier.audioKbps * 1000 : nil,
+                            sourceBitrate: sourceBitrate,
+                            profile: .emailFriendly
+                        ),
                         audioBitrate: hasAudio ? tier.audioKbps * 1000 : nil,
                         audioChannels: hasAudio ? (tier.audioMono ? 1 : max(1, min(2, sourceChannels))) : nil,
                         initialProgress: 0.1
@@ -518,6 +590,56 @@ struct VideoCompressor: Compressor {
                 maxSupportedDuration: maxDuration
             )
         }
+    }
+
+    private static func cappedVideoBitrate(
+        desiredVideoBitrate: Int,
+        audioBitrate: Int?,
+        sourceBitrate: SourceBitrate?,
+        profile: VideoPreset.Profile
+    ) -> Int {
+        guard let sourceTotal = sourceBitrate?.totalBitsPerSecond else {
+            return desiredVideoBitrate
+        }
+
+        let audioBitsPerSecond = Double(audioBitrate ?? 0)
+        let allowedTotalMultiplier: Double
+        switch profile {
+        case .highQuality:
+            allowedTotalMultiplier = 1.02
+        case .balanced:
+            allowedTotalMultiplier = 0.92
+        case .tiny:
+            allowedTotalMultiplier = 0.72
+        case .emailFriendly:
+            allowedTotalMultiplier = 0.90
+        }
+
+        let allowedVideo = max(
+            120_000.0,
+            sourceTotal * allowedTotalMultiplier - audioBitsPerSecond
+        )
+        return min(desiredVideoBitrate, Int(allowedVideo.rounded(.down)))
+    }
+
+    private static func shouldPassthroughSource(
+        source: URL,
+        destinationContainer: OutputContainer,
+        sourceSize: CGSize,
+        plan: EncodingPlan,
+        sourceBitrate: SourceBitrate?,
+        preset: VideoPreset,
+        commonOptions: CompressionRequest.CommonOptions
+    ) -> Bool {
+        guard !commonOptions.stripMetadata else { return false }
+        guard preset.profile == .balanced || preset.profile == .highQuality else { return false }
+        guard sourceSize == plan.targetSize else { return false }
+        guard let sourceTotal = sourceBitrate?.totalBitsPerSecond, sourceTotal < 250_000 else { return false }
+        guard let sourceContainer = try? outputContainer(for: source),
+              sourceContainer.pathExtension == destinationContainer.pathExtension else {
+            return false
+        }
+        return true
     }
 
     private static func scaledBitrate(
@@ -731,6 +853,39 @@ struct VideoCompressor: Compressor {
             sampleRate: streamDesc.mSampleRate > 0 ? streamDesc.mSampleRate : 44_100,
             channels: streamDesc.mChannelsPerFrame > 0 ? Int(streamDesc.mChannelsPerFrame) : 2
         )
+    }
+
+    private static func sourceBitrate(
+        videoTrack: AVAssetTrack,
+        audioTrack: AVAssetTrack?,
+        sourceBytes: Int64,
+        sourceDuration: TimeInterval
+    ) async throws -> SourceBitrate? {
+        guard sourceDuration > 0 else { return nil }
+
+        let videoEstimated = try? await videoTrack.load(.estimatedDataRate)
+        let audioEstimated = try? await audioTrack?.load(.estimatedDataRate)
+
+        let normalizedVideo = normalizeEstimatedDataRate(videoEstimated)
+        let normalizedAudio = normalizeEstimatedDataRate(audioEstimated)
+        if normalizedVideo != nil || normalizedAudio != nil {
+            return SourceBitrate(
+                videoBitsPerSecond: normalizedVideo,
+                audioBitsPerSecond: normalizedAudio
+            )
+        }
+
+        let totalFromFile = Double(sourceBytes) * 8.0 / sourceDuration
+        guard totalFromFile.isFinite, totalFromFile > 0 else { return nil }
+        return SourceBitrate(
+            videoBitsPerSecond: totalFromFile,
+            audioBitsPerSecond: nil
+        )
+    }
+
+    private static func normalizeEstimatedDataRate(_ value: Float?) -> Double? {
+        guard let value, value.isFinite, value > 0 else { return nil }
+        return Double(value)
     }
 
     // MARK: - Filesystem helpers
