@@ -27,10 +27,14 @@ crunch photo.jpg -o photo_small.jpg --preset small-file
 ## Features
 
 - Static image compression (JPEG, PNG, HEIC, TIFF, BMP) via ImageIO
-- Animated images (GIF, APNG, animated WebP): passed through unchanged in v0.1
-- PDF, video, and audio compression: stubbed in v0.1; landing in v0.2
+- Animated image compression for GIF, APNG, animated WebP, and animated HEIC
+- PDF compression that preserves searchable text, page structure, and OCR text
+- Video compression with balanced / high-quality / tiny / email-friendly presets
+- Audio compression to AAC/M4A with metadata preservation or stripping
 - Four preset profiles shared across kinds: `balanced`, `high-quality`,
   `small-file`, `tiny` — plus `email-friendly` (video) and `voice` (audio)
+- Output-preservation guardrails so Crunch keeps the original bytes when
+  recompression would make a file larger and passthrough still honors the request
 - No third-party dependencies in the engine — only Apple frameworks
   (AVFoundation, PDFKit, ImageIO, CoreImage, CoreGraphics)
 - No network imports anywhere in `Sources/`; enforced by a CI lint

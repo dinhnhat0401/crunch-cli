@@ -205,17 +205,9 @@ final class PDFCompressorTests: XCTestCase {
 
     // MARK: - Compression
 
-    /// The balanced preset should shrink PDFs that embed raster images.
-    /// If a future PDFKit build decides our fixture isn't compressible
-    /// (e.g. the default raster encoding is already JPEG-tight), we
-    /// fall back to `outputBytes <= sourceBytes` and track the stricter
-    /// assertion as a TODO.
-    ///
-    /// TODO(v0.2): enforce a strict inequality once we switch to
-    /// per-image CGPDFContent-stream rewriting with a controllable JPEG
-    /// quality knob. PDFKit's `OptimizeImagesForScreen` doesn't expose
-    /// a DPI dial, so on small synthetic fixtures the savings can
-    /// occasionally be flat.
+    /// The balanced preset should materially shrink PDFs that embed raster
+    /// images. The fixture uses large noisy images so the Quartz filter
+    /// settings have real work to do.
     func testPDFBalancedPresetShrinksOutputWhenImagesPresent() async throws {
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -237,11 +229,50 @@ final class PDFCompressorTests: XCTestCase {
         for try await _ in Crunch.compress(request) {}
 
         let outputBytes = try byteCount(of: output)
-        XCTAssertLessThanOrEqual(
+        XCTAssertLessThan(
             outputBytes,
             sourceBytes,
-            "balanced preset must not grow the file on an image-heavy fixture"
+            "balanced preset should shrink an image-heavy fixture"
         )
+    }
+
+    func testPDFProfilesGetProgressivelySmallerOnImageHeavySource() async throws {
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let source = dir.appendingPathComponent("source.pdf")
+        try writeTestPDF(to: source, pages: 3, withImage: true)
+
+        let highQualityOutput = dir.appendingPathComponent("hq.pdf")
+        let balancedOutput = dir.appendingPathComponent("balanced.pdf")
+        let smallFileOutput = dir.appendingPathComponent("small.pdf")
+        let tinyOutput = dir.appendingPathComponent("tiny.pdf")
+
+        for (preset, output) in [
+            (PDFPreset(profile: .highQuality), highQualityOutput),
+            (PDFPreset(profile: .balanced), balancedOutput),
+            (PDFPreset(profile: .smallFile), smallFileOutput),
+            (PDFPreset(profile: .tiny), tinyOutput),
+        ] {
+            let request = CompressionRequest(
+                source: source,
+                destination: .explicit(output),
+                preset: .pdf(preset),
+                commonOptions: .init(overwriteExisting: true, stripMetadata: false)
+            )
+            for try await _ in Crunch.compress(request) {}
+        }
+
+        let highQualityBytes = try byteCount(of: highQualityOutput)
+        let balancedBytes = try byteCount(of: balancedOutput)
+        let smallFileBytes = try byteCount(of: smallFileOutput)
+        let tinyBytes = try byteCount(of: tinyOutput)
+
+        XCTAssertGreaterThan(highQualityBytes, 0)
+        XCTAssertLessThanOrEqual(balancedBytes, highQualityBytes)
+        XCTAssertLessThanOrEqual(smallFileBytes, balancedBytes)
+        XCTAssertLessThanOrEqual(tinyBytes, smallFileBytes)
+        XCTAssertLessThan(tinyBytes, highQualityBytes)
     }
 
     func testPDFBalancedDoesNotBloatTextOnlySource() async throws {
@@ -388,10 +419,17 @@ final class PDFCompressorTests: XCTestCase {
         task.cancel()
         _ = await task.value
 
-        // Give the background task a moment to run its `defer` cleanup
-        // after the stream tears down. The compressor's `defer` removes
-        // the tmp file synchronously once the Task exits.
-        try await Task.sleep(for: .milliseconds(200))
+        // Wait for the background task to run its `defer` cleanup after
+        // the stream tears down. PDFKit save work can take a moment to
+        // unwind after cancellation, so poll briefly rather than assume
+        // a fixed 200 ms window.
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if try recentCrunchTmpFiles().isEmpty {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
 
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: output.path),
@@ -399,23 +437,29 @@ final class PDFCompressorTests: XCTestCase {
         )
 
         // Verify no leftover .tmp files in our Crunch temp subdir.
+        let leftovers = try recentCrunchTmpFiles()
+        XCTAssertTrue(
+            leftovers.isEmpty,
+            "found leftover tmp file(s) from this test run: \(leftovers.map(\.path).joined(separator: ", "))"
+        )
+    }
+
+    private func recentCrunchTmpFiles() throws -> [URL] {
         let crunchTmp = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("Crunch", isDirectory: true)
-        if FileManager.default.fileExists(atPath: crunchTmp.path) {
-            let children = try FileManager.default.contentsOfDirectory(
-                at: crunchTmp,
-                includingPropertiesForKeys: nil
-            )
-            for child in children where child.pathExtension == "tmp" {
-                // We only inspect files this test could have produced —
-                // by UUID + recent ctime. The defer block should have
-                // cleared them; anything lingering is a real leak.
-                let attrs = try FileManager.default.attributesOfItem(atPath: child.path)
-                if let ctime = attrs[.creationDate] as? Date,
-                   Date().timeIntervalSince(ctime) < 60 {
-                    XCTFail("found leftover tmp file from this test run: \(child.path)")
-                }
-            }
+        guard FileManager.default.fileExists(atPath: crunchTmp.path) else {
+            return []
+        }
+
+        let children = try FileManager.default.contentsOfDirectory(
+            at: crunchTmp,
+            includingPropertiesForKeys: nil
+        )
+        return try children.filter { child in
+            guard child.pathExtension == "tmp" else { return false }
+            let attrs = try FileManager.default.attributesOfItem(atPath: child.path)
+            guard let ctime = attrs[.creationDate] as? Date else { return false }
+            return Date().timeIntervalSince(ctime) < 60
         }
     }
 

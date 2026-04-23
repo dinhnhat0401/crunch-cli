@@ -328,19 +328,28 @@ struct VideoCompressor: Compressor {
                         throw CrunchError.compressionFailed(kind: .video, underlying: underlying)
                     }
 
+                    let finalOutputBytes = try OutputPreserver.replaceWithSourceIfLarger(
+                        source: source,
+                        candidate: localTmpURL,
+                        sourceBytes: sourceBytes,
+                        sourceExtension: source.pathExtension,
+                        candidateExtension: container.pathExtension,
+                        stripMetadata: commonOptions.stripMetadata,
+                        allowsPassthrough: preset.profile == .balanced || preset.profile == .highQuality
+                    )
+
                     continuation.yield(.progress(fraction: 1.0))
 
                     try Task.checkCancellation()
 
                     try VideoCompressor.atomicallyMove(from: localTmpURL, to: destination)
 
-                    let outputBytes = try VideoCompressor.byteCount(of: destination)
                     let duration = ContinuousClock.now - start
                     let result = CompressionResult(
                         source: source,
                         output: destination,
                         sourceBytes: sourceBytes,
-                        outputBytes: outputBytes,
+                        outputBytes: finalOutputBytes,
                         duration: duration,
                         kind: .video
                     )

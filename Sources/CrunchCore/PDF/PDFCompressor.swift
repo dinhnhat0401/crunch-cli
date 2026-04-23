@@ -2,16 +2,14 @@ import Foundation
 import PDFKit
 import ImageIO
 import CoreGraphics
+import Quartz
 import UniformTypeIdentifiers
 
 /// PDF compressor using PDFKit's `writeToURL(withOptions:)` pipeline with
-/// image-optimization keys introduced in macOS 13.4 / iOS 16.4:
-///
-/// - `PDFDocumentOptimizeImagesForScreenOption` — caps embedded raster
-///   resolution at a screen-friendly DPI while leaving text operators,
-///   vector art, and annotations untouched.
-/// - `PDFDocumentSaveImagesAsJPEGOption` — re-encodes embedded rasters as
-///   JPEG, which is the dominant byte-saver on most real-world PDFs.
+/// Quartz image filters. This keeps PDF text/vector structure intact while
+/// letting us tune embedded raster image resampling and JPEG quality per
+/// preset. The writer also enables `saveTextFromOCROption` so OCR text stays
+/// in the output when the source carries it.
 ///
 /// This is *Approach A* from the design brief. We considered the
 /// page-by-page `CGContext.drawPDFPage` re-draw route (Approach B) but it
@@ -23,24 +21,19 @@ import UniformTypeIdentifiers
 /// swapping raster XObjects, which is exactly what SYSTEM-DESIGN §9.3
 /// requires.
 ///
-/// The per-profile DPI ladder (150 / 100 / 72 / 50) is implemented by
-/// combining the two options above:
+/// The per-profile DPI ladder is implemented with Quartz filter image
+/// settings rather than PDFKit's blunt "optimize for screen" toggle:
 ///
 /// | Profile     | optimize | jpeg | Intent                              |
 /// |-------------|----------|------|-------------------------------------|
-/// | highQuality | no       | no   | no-op re-pack; strip metadata only  |
-/// | balanced    | no       | yes  | re-encode images as JPEG (~100 DPI) |
-/// | smallFile   | yes      | yes  | screen-optimize + JPEG (~72 DPI)    |
-/// | tiny        | yes      | yes  | screen-optimize + JPEG (~50 DPI)    |
+/// | highQuality | 150 DPI / q0.85 | archive / print-safe |
+/// | balanced    | 120 DPI / q0.70 | default sharing      |
+/// | smallFile   | 96 DPI / q0.55  | email / web          |
+/// | tiny        | 72 DPI / q0.40  | aggressive sharing   |
 ///
-/// PDFKit does not expose a numeric DPI knob — the "screen" target is
-/// roughly 144 DPI in practice. That's a documented v0.2 gap: the
-/// highQuality / tiny pair under-differentiate on image-heavy PDFs. We
-/// accept this trade rather than rasterize pages; losing text extraction
-/// would violate the SYSTEM-DESIGN §9.3 invariant that the legal /
-/// knowledge-worker personas depend on. Grayscale conversion and font
-/// stripping are intentionally absent from the v1.0 public API until the
-/// lower-level `CGPDFContentStream` rewrite path exists to honor them.
+/// This gives the profiles real separation without rasterizing whole pages,
+/// which would violate the SYSTEM-DESIGN §9.3 invariant that searchable text
+/// and document structure survive compression.
 ///
 /// References:
 /// - SYSTEM-DESIGN §9.3 (PDF pipeline invariants — text preservation)
@@ -202,23 +195,53 @@ struct PDFCompressor: Compressor {
     private static func writeOptions(
         for preset: PDFPreset
     ) -> [PDFDocumentWriteOption: Any] {
-        var options: [PDFDocumentWriteOption: Any] = [:]
-        switch preset.profile {
-        case .highQuality:
-            // No image downsampling; the write is essentially a re-pack
-            // that still honours metadata stripping via the document
-            // attributes pass above.
-            break
-        case .balanced:
-            options[.saveImagesAsJPEGOption] = true
-        case .smallFile:
-            options[.optimizeImagesForScreenOption] = true
-            options[.saveImagesAsJPEGOption] = true
-        case .tiny:
-            options[.optimizeImagesForScreenOption] = true
-            options[.saveImagesAsJPEGOption] = true
+        var options: [PDFDocumentWriteOption: Any] = [
+            PDFDocumentWriteOption.saveTextFromOCROption: true,
+        ]
+        if let filter = quartzFilter(for: preset.profile) {
+            options[PDFDocumentWriteOption(rawValue: "QuartzFilter")] = filter
         }
         return options
+    }
+
+    private static func quartzFilter(
+        for profile: PDFPreset.Profile
+    ) -> QuartzFilter? {
+        let settings = quartzImageSettings(for: profile)
+        let properties: [String: Any] = [
+            "Name": "Crunch \(profile.filterNameSuffix)",
+            "FilterType": NSNumber(value: 1),
+            "FilterData": [
+                "ColorSettings": [
+                    "ImageSettings": [
+                        "Compression Quality": NSNumber(value: settings.compressionQuality),
+                        "ImageCompression": "ImageJPEGCompress",
+                        "ImageScaleSettings": [
+                            "ImageResolution": NSNumber(value: settings.resolution),
+                            "ImageScaleInterpolate": NSNumber(value: 1),
+                            "ImageSizeMax": NSNumber(value: settings.maxDimension),
+                            "ImageSizeMin": NSNumber(value: 0),
+                        ],
+                    ],
+                ],
+            ],
+        ]
+        return QuartzFilter(properties: properties)
+    }
+
+    private static func quartzImageSettings(
+        for profile: PDFPreset.Profile
+    ) -> QuartzImageSettings {
+        switch profile {
+        case .highQuality:
+            return .init(resolution: 150, maxDimension: 3000, compressionQuality: 0.85)
+        case .balanced:
+            return .init(resolution: 120, maxDimension: 2200, compressionQuality: 0.70)
+        case .smallFile:
+            return .init(resolution: 96, maxDimension: 1600, compressionQuality: 0.55)
+        case .tiny:
+            return .init(resolution: 72, maxDimension: 1200, compressionQuality: 0.40)
+        }
     }
 
     // MARK: - Metadata
@@ -288,6 +311,23 @@ struct PDFCompressor: Compressor {
             } catch {
                 throw CrunchError.destinationNotWritable(destination)
             }
+        }
+    }
+}
+
+private struct QuartzImageSettings {
+    let resolution: Int
+    let maxDimension: Int
+    let compressionQuality: Double
+}
+
+private extension PDFPreset.Profile {
+    var filterNameSuffix: String {
+        switch self {
+        case .highQuality: return "High Quality"
+        case .balanced: return "Balanced"
+        case .smallFile: return "Small File"
+        case .tiny: return "Tiny"
         }
     }
 }
