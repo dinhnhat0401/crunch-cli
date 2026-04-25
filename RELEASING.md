@@ -27,6 +27,26 @@ Generate the base64 cert with:
 base64 -i DeveloperID.p12 | pbcopy
 ```
 
+**Credential hygiene** — these are public-repo guardrails, please follow them:
+
+- Never commit `.p12`, `.pem`, `.cer`, `.key`, or `.env` files. `.gitignore`
+  blocks the common extensions, but treat the list as a safety net, not a
+  policy.
+- Use an **app-specific password** for `APPLE_APP_PASSWORD`
+  (appleid.apple.com → Sign-In and Security → App-Specific Passwords). Never
+  use your real Apple ID password.
+- `HOMEBREW_TAP_TOKEN` should be a fine-grained PAT scoped to **only**
+  `dinhnhat0401/homebrew-crunch` with `Contents: read & write`. Set a short
+  expiry (90 days) and rotate.
+- The release workflow uses `git http.extraheader` instead of putting the
+  PAT in the clone URL, so the token never lands in `.git/config` on the
+  ephemeral runner.
+- A cleanup step (`if: always()`) deletes the temp keychain and overwrites
+  the decoded `.p12` before the runner shuts down.
+- The workflow runs on `push: tags: ["v*"]` and `workflow_dispatch` only —
+  not `pull_request`, so forks cannot trigger a release or read these
+  secrets.
+
 ## Cutting a release
 
 1. Update `CHANGELOG.md` — move items from `[Unreleased]` into a new

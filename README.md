@@ -3,6 +3,8 @@
 [![CI](https://github.com/dinhnhat0401/crunch-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/dinhnhat0401/crunch-cli/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![macOS 14+](https://img.shields.io/badge/macOS-14%2B-black.svg)](https://www.apple.com/macos/)
+[![Swift 5.10+](https://img.shields.io/badge/Swift-5.10%2B-orange.svg)](https://swift.org)
+[![SwiftPM compatible](https://img.shields.io/badge/SwiftPM-compatible-brightgreen.svg)](https://swift.org/package-manager/)
 
 Compress video, image, PDF, and audio files on your Mac. All processing stays
 on-device — no uploads, no network, no third-party binaries. `crunch-cli` is
@@ -10,13 +12,39 @@ the open-source compression engine behind the Crunch Mac app.
 
 ## Install
 
-A Homebrew tap is planned; it doesn't exist yet. In the meantime, build from
-source (see below) or wait for the `v0.1.0` release.
+### Homebrew (recommended, once `v0.1.0` is tagged)
 
 ```
-# (planned, not yet published)
 brew install dinhnhat0401/crunch/crunch
 ```
+
+### From source
+
+```
+git clone https://github.com/dinhnhat0401/crunch-cli
+cd crunch-cli
+swift build -c release
+.build/release/crunch --help
+```
+
+### As a Swift Package (`CrunchCore` library)
+
+Add to your `Package.swift`:
+
+```swift
+.package(url: "https://github.com/dinhnhat0401/crunch-cli", from: "0.1.0"),
+```
+
+Then depend on the `CrunchCore` product:
+
+```swift
+.target(name: "YourApp", dependencies: [
+    .product(name: "CrunchCore", package: "crunch-cli"),
+]),
+```
+
+In Xcode: `File` → `Add Package Dependencies…` → paste the repo URL and
+select the `CrunchCore` library product.
 
 ## Quick start
 
@@ -41,24 +69,15 @@ crunch photo.jpg -o photo_small.jpg --preset small-file
 
 ## Documentation
 
-- `guide/` — user guide (to be published)
-- [Design docs](./) — see `ARCHITECTURE-ENGINE.md` and `SYSTEM-DESIGN.md` in
-  the private design repo for the full contract
+Run `crunch --help` and `crunch list-presets` for usage. A standalone user
+guide is planned for a later release.
 
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md).
+See [CONTRIBUTING.md](./CONTRIBUTING.md). Security issues: see
+[SECURITY.md](./SECURITY.md).
 
 The headline rule: no network imports, ever. CI enforces it.
-
-## Build from source
-
-```
-git clone https://github.com/dinhnhat0401/crunch-cli
-cd crunch-cli
-swift build -c release
-.build/release/crunch --help
-```
 
 ## License
 
