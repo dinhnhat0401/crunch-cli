@@ -19,9 +19,10 @@ Use GitHub's private vulnerability disclosure:
 1. Go to https://github.com/dinhnhat0401/crunch-cli/security/advisories/new
 2. Fill in the report; the maintainer is notified privately.
 
-If GitHub Security Advisories are unavailable, email
-`security@bitcoin.com` with the subject line `crunch-cli vulnerability`
-and we'll route it.
+If you cannot use GitHub Security Advisories, open a minimal public issue
+that says only "I have a security report to send" and the maintainer will
+reach out for a private channel. Do **not** include details of the
+vulnerability in that issue.
 
 ## Scope
 

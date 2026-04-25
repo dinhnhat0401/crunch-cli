@@ -33,6 +33,40 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Resolved version=$VERSION (tag=$TAG)"
 
+      - name: Compute capability flags
+        id: caps
+        env:
+          HAS_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 != '' }}
+          HAS_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD != '' }}
+          HAS_IDENTITY: ${{ secrets.DEVELOPER_ID_IDENTITY != '' }}
+          HAS_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
+          HAS_TEAM_ID: ${{ secrets.APPLE_TEAM_ID != '' }}
+          HAS_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD != '' }}
+        run: |
+          set -euo pipefail
+          # Signing requires the full cert + password + identity triple.
+          # Notarization requires Apple ID + team ID + app-specific password
+          # AND a signed binary (codesign step must have run).
+          if [ "$HAS_P12" = "true" ] && [ "$HAS_P12_PASSWORD" = "true" ] && [ "$HAS_IDENTITY" = "true" ]; then
+            HAS_SIGNING=true
+          else
+            HAS_SIGNING=false
+          fi
+          if [ "$HAS_SIGNING" = "true" ] && [ "$HAS_APPLE_ID" = "true" ] && [ "$HAS_TEAM_ID" = "true" ] && [ "$HAS_APP_PASSWORD" = "true" ]; then
+            HAS_NOTARIZATION=true
+          else
+            HAS_NOTARIZATION=false
+          fi
+          echo "has_signing=$HAS_SIGNING" >> "$GITHUB_OUTPUT"
+          echo "has_notarization=$HAS_NOTARIZATION" >> "$GITHUB_OUTPUT"
+          echo "Signing: $HAS_SIGNING / Notarization: $HAS_NOTARIZATION"
+          if [ "$HAS_SIGNING" != "true" ]; then
+            echo "::warning ::Developer ID secrets incomplete or missing — release will be unsigned."
+          fi
+          if [ "$HAS_NOTARIZATION" != "true" ] && [ "$HAS_SIGNING" = "true" ]; then
+            echo "::warning ::Notarization secrets incomplete — release will be signed but not notarized."
+          fi
+
       - name: Show toolchain
         run: swift --version
 
@@ -47,7 +81,7 @@ jobs:
           lipo -info dist/crunch
 
       - name: Import Developer ID signing certificate
-        if: env.DEVELOPER_ID_CERT_P12 != ''
+        if: steps.caps.outputs.has_signing == 'true'
         env:
           DEVELOPER_ID_CERT_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
           DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
@@ -59,21 +93,26 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           CERT_PATH="$RUNNER_TEMP/cert.p12"
-          echo "$DEVELOPER_ID_CERT_P12" | base64 --decode > "$CERT_PATH"
+          # macOS BSD base64 takes -D for decode (GNU --decode is unreliable
+          # across macOS versions; -D has been the BSD form since 10.x).
+          echo "$DEVELOPER_ID_CERT_P12" | base64 -D > "$CERT_PATH"
           security import "$CERT_PATH" \
             -P "$DEVELOPER_ID_CERT_PASSWORD" \
             -A -t cert -f pkcs12 \
             -k "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychain -d user | tr -d '"')
+          # Add the build keychain to the user search list while preserving
+          # existing keychains. The subcommand is `list-keychains` (plural).
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
       - name: Codesign binary
-        if: env.DEVELOPER_ID_IDENTITY != ''
+        if: steps.caps.outputs.has_signing == 'true'
         env:
           DEVELOPER_ID_IDENTITY: ${{ secrets.DEVELOPER_ID_IDENTITY }}
         run: |
+          set -euo pipefail
           codesign --force --options runtime --timestamp \
             --sign "$DEVELOPER_ID_IDENTITY" \
             dist/crunch
@@ -95,8 +134,8 @@ jobs:
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Notarize and staple
-        if: env.APPLE_ID != ''
+      - name: Notarize
+        if: steps.caps.outputs.has_notarization == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -115,7 +154,7 @@ jobs:
           # result. Verify the binary is acceptable to spctl.
           spctl --assess --type execute --verbose=4 dist/crunch || true
 
-      - name: Final tarball (signed + notarized)
+      - name: Final tarball
         id: final
         run: |
           set -euo pipefail
