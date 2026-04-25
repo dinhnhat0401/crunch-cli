@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose a new preset, codec path, or CLI capability
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user-visible outcome are you trying to achieve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What change to `crunch` or `CrunchCore` would solve it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope guardrails
+      description: Confirm the proposal fits the engine's invariants.
+      options:
+        - label: "No new third-party dependencies (Apple frameworks only)."
+          required: true
+        - label: "No network access — `URLSession`/`URLRequest`/`Network` stay forbidden."
+          required: true

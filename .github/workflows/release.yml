@@ -1,0 +1,253 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build, sign, notarize, release
+    runs-on: macos-14
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        run: |
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$VERSION (tag=$TAG)"
+
+      - name: Compute capability flags
+        id: caps
+        env:
+          HAS_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 != '' }}
+          HAS_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD != '' }}
+          HAS_IDENTITY: ${{ secrets.DEVELOPER_ID_IDENTITY != '' }}
+          HAS_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
+          HAS_TEAM_ID: ${{ secrets.APPLE_TEAM_ID != '' }}
+          HAS_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD != '' }}
+        run: |
+          set -euo pipefail
+          # Signing requires the full cert + password + identity triple.
+          # Notarization requires Apple ID + team ID + app-specific password
+          # AND a signed binary (codesign step must have run).
+          if [ "$HAS_P12" = "true" ] && [ "$HAS_P12_PASSWORD" = "true" ] && [ "$HAS_IDENTITY" = "true" ]; then
+            HAS_SIGNING=true
+          else
+            HAS_SIGNING=false
+          fi
+          if [ "$HAS_SIGNING" = "true" ] && [ "$HAS_APPLE_ID" = "true" ] && [ "$HAS_TEAM_ID" = "true" ] && [ "$HAS_APP_PASSWORD" = "true" ]; then
+            HAS_NOTARIZATION=true
+          else
+            HAS_NOTARIZATION=false
+          fi
+          echo "has_signing=$HAS_SIGNING" >> "$GITHUB_OUTPUT"
+          echo "has_notarization=$HAS_NOTARIZATION" >> "$GITHUB_OUTPUT"
+          echo "Signing: $HAS_SIGNING / Notarization: $HAS_NOTARIZATION"
+          if [ "$HAS_SIGNING" != "true" ]; then
+            echo "::warning ::Developer ID secrets incomplete or missing — release will be unsigned."
+          fi
+          if [ "$HAS_NOTARIZATION" != "true" ] && [ "$HAS_SIGNING" = "true" ]; then
+            echo "::warning ::Notarization secrets incomplete — release will be signed but not notarized."
+          fi
+
+      - name: Show toolchain
+        run: swift --version
+
+      - name: Build universal release binary
+        run: |
+          swift build -c release \
+            --arch arm64 \
+            --arch x86_64
+          mkdir -p dist
+          cp .build/apple/Products/Release/crunch dist/crunch
+          file dist/crunch
+          lipo -info dist/crunch
+
+      - name: Import Developer ID signing certificate
+        if: steps.caps.outputs.has_signing == 'true'
+        env:
+          DEVELOPER_ID_CERT_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+          DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          # macOS BSD base64 takes -D for decode (GNU --decode is unreliable
+          # across macOS versions; -D has been the BSD form since 10.x).
+          echo "$DEVELOPER_ID_CERT_P12" | base64 -D > "$CERT_PATH"
+          security import "$CERT_PATH" \
+            -P "$DEVELOPER_ID_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          # Add the build keychain to the user search list while preserving
+          # existing keychains. The subcommand is `list-keychains` (plural).
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Codesign binary
+        if: steps.caps.outputs.has_signing == 'true'
+        env:
+          DEVELOPER_ID_IDENTITY: ${{ secrets.DEVELOPER_ID_IDENTITY }}
+        run: |
+          set -euo pipefail
+          codesign --force --options runtime --timestamp \
+            --sign "$DEVELOPER_ID_IDENTITY" \
+            dist/crunch
+          codesign --verify --strict --verbose=2 dist/crunch
+
+      - name: Package zip for notarization
+        id: pack
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          NAME="crunch-${VERSION}-macos-universal"
+          mkdir -p "dist/$NAME"
+          cp dist/crunch "dist/$NAME/crunch"
+          cp LICENSE "dist/$NAME/LICENSE"
+          cp README.md "dist/$NAME/README.md"
+          # ditto produces a notarization-friendly zip (preserves metadata).
+          ( cd dist && /usr/bin/ditto -c -k --keepParent "$NAME" "${NAME}.zip" )
+          echo "zip=dist/${NAME}.zip" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Notarize
+        if: steps.caps.outputs.has_notarization == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          ZIP: ${{ steps.pack.outputs.zip }}
+        run: |
+          set -euo pipefail
+          xcrun notarytool submit "$ZIP" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+          # Stapler can't attach a ticket to a raw Mach-O binary, but the
+          # notarization record is permanently registered with Apple's CDN.
+          # Gatekeeper looks it up online on first run, then caches the
+          # result. Verify the binary is acceptable to spctl.
+          spctl --assess --type execute --verbose=4 dist/crunch || true
+
+      - name: Final tarball
+        id: final
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.pack.outputs.name }}"
+          ( cd dist && tar -czf "${NAME}.tar.gz" "$NAME" )
+          ( cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          echo "tarball=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${NAME}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Extract release notes for tag
+        id: notes
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.version }}"
+          if [ -f CHANGELOG.md ]; then
+            awk -v ver="$VERSION" '
+              $0 ~ "^## \\[" ver "\\]" { capture=1; next }
+              capture && /^## \[/ { exit }
+              capture { print }
+            ' CHANGELOG.md > release-notes.md
+          fi
+          if [ ! -s release-notes.md ]; then
+            echo "Release $VERSION" > release-notes.md
+          fi
+          echo "path=release-notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file "${{ steps.notes.outputs.path }}" \
+            "${{ steps.final.outputs.tarball }}" \
+            "${{ steps.final.outputs.checksum }}"
+
+      - name: Bump Homebrew tap formula
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          NAME: ${{ steps.pack.outputs.name }}
+        run: |
+          set -euo pipefail
+          SHA256=$(awk '{print $1}' "${{ steps.final.outputs.checksum }}")
+          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${NAME}.tar.gz"
+          WORK="$RUNNER_TEMP/tap"
+          # Authenticate via extraheader instead of embedding the token in the
+          # clone URL — keeps the token out of .git/config on disk.
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$HOMEBREW_TAP_TOKEN" | base64 | tr -d '\n')"
+          git -c "http.https://github.com/.extraheader=$AUTH_HEADER" \
+              clone "https://github.com/dinhnhat0401/homebrew-crunch.git" "$WORK"
+          mkdir -p "$WORK/Formula"
+          cat > "$WORK/Formula/crunch.rb" <<RUBY
+          class Crunch < Formula
+            desc "Compress video, image, PDF, and audio files locally on macOS"
+            homepage "https://github.com/dinhnhat0401/crunch-cli"
+            url "${URL}"
+            sha256 "${SHA256}"
+            version "${VERSION}"
+            license "MIT"
+
+            depends_on :macos => :sonoma
+
+            def install
+              bin.install "crunch"
+            end
+
+            test do
+              assert_match "crunch ${VERSION}", shell_output("#{bin}/crunch --version")
+            end
+          end
+          RUBY
+          cd "$WORK"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/crunch.rb
+          git commit -m "crunch ${VERSION}"
+          git -c "http.https://github.com/.extraheader=$AUTH_HEADER" push origin HEAD
+
+      - name: Cleanup signing keychain and decoded cert
+        if: always()
+        run: |
+          set +e
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          if [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+          fi
+          if [ -f "$CERT_PATH" ]; then
+            # Best-effort overwrite before unlink. macOS rm has no -P; use dd.
+            dd if=/dev/zero of="$CERT_PATH" bs=1024 count=64 conv=notrunc 2>/dev/null || true
+            rm -f "$CERT_PATH"
+          fi
+          exit 0
