@@ -8,7 +8,7 @@ struct CrunchCLI: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "crunch",
         abstract: "Compress video, image, PDF and audio files locally on your Mac.",
-        version: "0.1.0-dev",
+        version: "0.1.0",
         subcommands: [CompressCommand.self, ListPresetsCommand.self],
         defaultSubcommand: CompressCommand.self
     )
