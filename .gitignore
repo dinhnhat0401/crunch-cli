@@ -4,3 +4,13 @@ DerivedData/
 .DS_Store
 *.xcodeproj
 Package.resolved
+
+# Credentials — never commit. Release credentials live in GitHub Secrets only.
+*.p12
+*.pem
+*.key
+*.cer
+*.mobileprovision
+.env
+.env.*
+!.env.example

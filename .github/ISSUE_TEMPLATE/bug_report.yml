@@ -1,0 +1,73 @@
+name: Bug report
+description: A reproducible bug in `crunch` or `CrunchCore`
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please do not include
+        sensitive material in attached files (real PII, customer data,
+        etc.). If your reproducer involves a private file, redact it or
+        share via private channel — see SECURITY.md.
+
+  - type: input
+    id: version
+    attributes:
+      label: crunch version
+      description: Output of `crunch --version`
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "14.5 (23F79)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: File kind
+      options:
+        - image (static)
+        - image (animated)
+        - video
+        - audio
+        - pdf
+        - other / cross-cutting
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Exact command and minimal sample input
+      placeholder: |
+        crunch input.mp4 -o out.mp4 --preset email-friendly
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Output / logs
+      render: shell

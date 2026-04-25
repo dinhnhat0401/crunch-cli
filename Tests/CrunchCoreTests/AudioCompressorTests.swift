@@ -378,8 +378,13 @@ final class AudioCompressorTests: XCTestCase {
 
         let source = dir.appendingPathComponent("long.wav")
         let output = dir.appendingPathComponent("out.m4a")
-        // Longer fixture so cancellation can land mid-pump.
-        try writeTestWAV(to: source, durationSeconds: 10.0, stereo: true)
+        // Long fixture so the AAC encode takes much longer than the
+        // pre-cancel sleep on the fastest hardware. Earlier 10 s and 60 s
+        // fixtures flaked when the encoder finished before cancellation
+        // could land. AAC encode on Apple Silicon is ~30–50× real-time, so
+        // 120 s of source ≈ 2.5–4 s of work, comfortably wider than the
+        // 250 ms cancel window below.
+        try writeTestWAV(to: source, durationSeconds: 120.0, stereo: true)
 
         // Snapshot the Crunch temp dir before the test so we can detect
         // a leftover .tmp file introduced by this run.
@@ -406,12 +411,12 @@ final class AudioCompressorTests: XCTestCase {
         }
 
         // Let the compressor start, then cancel it.
-        try? await Task.sleep(nanoseconds: 50_000_000) // 50 ms
+        try? await Task.sleep(nanoseconds: 250_000_000) // 250 ms
         task.cancel()
         _ = await task.value
 
         // Give the defer-based cleanup a beat to run.
-        try? await Task.sleep(nanoseconds: 100_000_000) // 100 ms
+        try? await Task.sleep(nanoseconds: 300_000_000) // 300 ms
 
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: output.path),
